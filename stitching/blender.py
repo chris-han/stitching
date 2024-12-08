@@ -1,6 +1,5 @@
 import cv2 as cv
-import numpy as np
-
+from typing import Union, cast
 
 class Blender:
     """https://docs.opencv.org/4.x/d6/d4a/classcv_1_1detail_1_1Blender.html"""
@@ -13,43 +12,54 @@ class Blender:
     DEFAULT_BLENDER = "multiband"
     DEFAULT_BLEND_STRENGTH = 5
 
-    def __init__(
-        self, blender_type=DEFAULT_BLENDER, blend_strength=DEFAULT_BLEND_STRENGTH
-    ):
+    def __init__(self, blender_type=DEFAULT_BLENDER, blend_strength=DEFAULT_BLEND_STRENGTH):
         self.blender_type = blender_type
         self.blend_strength = blend_strength
-        self.blender = None
+        self.blender = self.create_blender(blender_type, blend_strength)
+
+    def create_blender(self, blender_type: str, blend_strength: int) -> Union[cv.detail.Blender, cv.detail.FeatherBlender, cv.detail.MultiBandBlender]:
+        if blender_type == "no":
+            blender = cv.detail.Blender_createDefault(cv.detail.Blender_NO)
+        elif blender_type == "feather":
+            blender = cast(cv.detail.FeatherBlender, cv.detail.Blender_createDefault(cv.detail.Blender_FEATHER))
+            # blender.setSharpness(blend_strength / 100.0)
+        elif blender_type == "multiband":
+            blender = cv.detail.Blender_createDefault(cv.detail.Blender_MULTI_BAND)
+        else:
+            raise ValueError(f"Unknown blender type {blender_type}")
+        
+        return blender
 
     def prepare(self, corners, sizes):
-        dst_sz = cv.detail.resultRoi(corners=corners, sizes=sizes)
-        blend_width = np.sqrt(dst_sz[2] * dst_sz[3]) * self.blend_strength / 100
-
-        if self.blender_type == "no" or blend_width < 1:
-            self.blender = cv.detail.Blender_createDefault(cv.detail.Blender_NO)
-
-        elif self.blender_type == "multiband":
-            self.blender = cv.detail_MultiBandBlender()
-            self.blender.setNumBands(int((np.log(blend_width) / np.log(2.0) - 1.0)))
-
-        elif self.blender_type == "feather":
-            self.blender = cv.detail_FeatherBlender()
-            self.blender.setSharpness(1.0 / blend_width)
-
-        self.blender.prepare(dst_sz)
+        sizes = [(int(s[0]), int(s[1])) for s in sizes]  # Ensure sizes are integers
+        self.blender.prepare(corners, sizes)
 
     def feed(self, img, mask, corner):
-        self.blender.feed(cv.UMat(img.astype(np.int16)), mask, corner)
+        if img is None:
+            raise ValueError("Image passed to feed is None")
+        if mask is None:
+            raise ValueError("Mask passed to feed is None")
+        if corner is None:
+            raise ValueError("Corner passed to feed is None")
+        
+        # Convert img to 16SC3 if it is not already
+        if img.dtype != 'int16' or img.shape[2] != 3:
+            img = img.astype('int16')
+
+        # Ensure the mask is of type CV_8UC1
+        if mask.dtype != 'uint8' or len(mask.shape) != 2:
+            raise ValueError("Mask must be of type CV_8UC1")
+
+        self.blender.feed(cv.UMat(img), cv.UMat(mask), corner)
 
     def blend(self):
-        result = None
-        result_mask = None
-        result, result_mask = self.blender.blend(result, result_mask)
-        result = cv.convertScaleAbs(result)
+        result, result_mask = self.blender.blend(None, None)
         return result, result_mask
 
     @classmethod
     def create_panorama(cls, imgs, masks, corners, sizes):
-        blender = cls("no")
+        # Use feather blender when blending multiple images
+        blender = cls("feather")
         blender.prepare(corners, sizes)
         for img, mask, corner in zip(imgs, masks, corners):
             blender.feed(img, mask, corner)

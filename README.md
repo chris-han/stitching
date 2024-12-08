@@ -41,6 +41,9 @@ starting with "IMG" and ending with ".jpg"
 `stitch img1.jpg img2.jpg img3.jpg`
 stitches the 3 explicit files of the current directory
 
+`stitch jpg/*.jpg --confidence_threshold=0.2`
+stitch with confidence threshold
+
 Enable verbose mode with `stitch *.jpg -v`.
 This will create a folder where all intermediate results are stored so that
 you can find out where there are problems with your images, if any

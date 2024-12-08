@@ -16,8 +16,8 @@ from .subsetter import Subsetter
 from .timelapser import Timelapser
 from .verbose import verbose_stitching
 from .warper import Warper
-
-
+import numpy as np
+import cv2
 class Stitcher:
     DEFAULT_SETTINGS = {
         "medium_megapix": Images.Resolution.MEDIUM.value,
@@ -46,7 +46,7 @@ class Stitcher:
         "timelapse": Timelapser.DEFAULT_TIMELAPSE,
         "timelapse_prefix": Timelapser.DEFAULT_TIMELAPSE_PREFIX,
     }
-
+    
     def __init__(self, **kwargs):
         self.initialize_stitcher(**kwargs)
 
@@ -57,13 +57,16 @@ class Stitcher:
         self.settings.update(kwargs)
 
         args = SimpleNamespace(**self.settings)
+        # Initialize instance variables with settings
         self.medium_megapix = args.medium_megapix
         self.low_megapix = args.low_megapix
         self.final_megapix = args.final_megapix
+
         if args.detector in ("orb", "sift"):
             self.detector = FeatureDetector(args.detector, nfeatures=args.nfeatures)
         else:
             self.detector = FeatureDetector(args.detector)
+
         match_conf = FeatureMatcher.get_match_conf(args.match_conf, args.detector)
         self.matcher = FeatureMatcher(
             args.matcher_type,
@@ -71,9 +74,11 @@ class Stitcher:
             try_use_gpu=args.try_use_gpu,
             match_conf=match_conf,
         )
+
         self.subsetter = Subsetter(
             args.confidence_threshold, args.matches_graph_dot_file
         )
+
         self.camera_estimator = CameraEstimator(args.estimator)
         self.camera_adjuster = CameraAdjuster(
             args.adjuster, args.refinement_mask, args.confidence_threshold
@@ -88,10 +93,23 @@ class Stitcher:
         self.blender = Blender(args.blender_type, args.blend_strength)
         self.timelapser = Timelapser(args.timelapse, args.timelapse_prefix)
 
-    def stitch_verbose(self, images, feature_masks=[], verbose_dir=None):
-        return verbose_stitching(self, images, feature_masks, verbose_dir)
+    def initialize_composition(self, corners, sizes, **kwargs):
+        self.dest_roi = self.calculate_dest_roi(corners, sizes)
+        if self.timelapser.do_timelapse:
+            self.timelapser.initialize(corners, sizes, **kwargs)
+        else:
+            self.blender.prepare(corners, sizes, **kwargs)
 
-    def stitch(self, images, feature_masks=[]):
+    def calculate_dest_roi(self, corners, sizes):
+        # Assuming a simple bounding box that covers all the image corners and sizes
+        top_left = [min(corner[0] for corner in corners), min(corner[1] for corner in corners)]
+        bottom_right = [max(corner[0] + size[0] for corner, size in zip(corners, sizes)),
+                        max(corner[1] + size[1] for corner, size in zip(corners, sizes))]
+        width = bottom_right[0] - top_left[0]
+        height = bottom_right[1] - top_left[1]
+        return top_left, width, height
+
+    def stitch(self, images, feature_masks=[], **kwargs):
         self.images = Images.of(
             images, self.medium_megapix, self.low_megapix, self.final_megapix
         )
@@ -120,13 +138,16 @@ class Stitcher:
             imgs, masks, corners, sizes
         )
         self.set_masks(masks)
-        imgs = self.compensate_exposure_errors(corners, imgs)
-        seam_masks = self.resize_seam_masks(seam_masks)
+        imgs = list(self.compensate_exposure_errors(corners, imgs))
+        seam_masks = list(self.resize_seam_masks(seam_masks))
 
-        self.initialize_composition(corners, sizes)
-        self.blend_images(imgs, seam_masks, corners)
+        self.initialize_composition(corners, sizes, **kwargs)
+        self.blend_images(imgs, seam_masks, corners, sizes)
         return self.create_final_panorama()
 
+    def stitch_verbose(self, images, feature_masks=[], verbose_dir=None):
+        return verbose_stitching(self, images, feature_masks, verbose_dir)
+    
     def resize_medium_resolution(self):
         return list(self.images.resize(Images.Resolution.MEDIUM))
 
@@ -214,49 +235,112 @@ class Stitcher:
         return self.seam_finder.find(imgs, corners, masks)
 
     def resize_final_resolution(self):
-        return self.images.resize(Images.Resolution.FINAL)
+        return list(self.images.resize(Images.Resolution.FINAL))
+
+    def resize_seam_masks(self, seam_masks):
+        print("[DEBUG] Resizing seam masks")
+        resized_masks = []
+        for idx, seam_mask in enumerate(seam_masks):
+            print(f'[DEBUG] Resizing seam mask {idx}')
+            mask = self.get_mask(idx)
+            print(f'[DEBUG] Got mask for seam mask {idx}')
+            resized_masks.append(SeamFinder.resize(seam_mask, mask))
+        return resized_masks
 
     def compensate_exposure_errors(self, corners, imgs):
         for idx, (corner, img) in enumerate(zip(corners, imgs)):
-            yield self.compensator.apply(idx, corner, img, self.get_mask(idx))
-
-    def resize_seam_masks(self, seam_masks):
-        for idx, seam_mask in enumerate(seam_masks):
-            yield SeamFinder.resize(seam_mask, self.get_mask(idx))
+            mask = self.get_mask(idx)
+            yield self.compensator.apply(idx, corner, img, mask)
 
     def set_masks(self, mask_generator):
-        self.masks = mask_generator
+        print("[DEBUG] Setting mask generator")
+        self.masks = list(mask_generator)  # Convert generator to list
         self.mask_index = -1
+        print("[DEBUG] Mask index initialized to -1")
 
     def get_mask(self, idx):
-        if idx == self.mask_index + 1:
-            self.mask_index += 1
-            self.mask = next(self.masks)
-            return self.mask
-        elif idx == self.mask_index:
-            return self.mask
-        else:
-            raise StitchingError("Invalid Mask Index!")
+        print(f"[DEBUG] get_mask called with idx: {idx}, current mask_index: {self.mask_index}")
+        try:
+            if idx < 0 or idx >= len(self.masks):
+                print(f"[ERROR] Invalid Mask Index: {idx}, valid range is 0-{len(self.masks)-1}")
+                raise StitchingError("Invalid Mask Index!")
+            
+            print(f"[DEBUG] Returning mask at index: {idx}")
+            return self.masks[idx]
+            
+        except IndexError:
+            print("[ERROR] Ran out of masks!")
+            raise StitchingError("Ran out of masks!")
 
-    def initialize_composition(self, corners, sizes):
-        if self.timelapser.do_timelapse:
-            self.timelapser.initialize(corners, sizes)
-        else:
-            self.blender.prepare(corners, sizes)
 
-    def blend_images(self, imgs, masks, corners):
-        for idx, (img, mask, corner) in enumerate(zip(imgs, masks, corners)):
+    def blend_images(self, images, seam_est_masks, corners, sizes):
+        try:
+            # Initialize blender with corners and sizes
             if self.timelapser.do_timelapse:
-                self.timelapser.process_and_save_frame(
-                    self.images.names[idx], img, corner
-                )
+                self.timelapser.initialize(corners, sizes)
             else:
-                self.blender.feed(img, mask, corner)
+                self.blender.prepare(corners, sizes)
+
+            # Feed images to blender
+            for idx, (img, mask, corner) in enumerate(zip(images, seam_est_masks, corners)):
+                try:
+                    # Convert UMat to regular numpy array if needed
+                    if isinstance(img, cv2.UMat):
+                        img = img.get()
+                    if isinstance(mask, cv2.UMat):
+                        mask = mask.get()
+                        
+                    print(f"Processing image {idx} with shape {img.shape}, mask shape {mask.shape}, corner {corner}")
+                    
+                    # Ensure img is of type CV_16SC3 and in valid range
+                    if img.dtype != np.int16:
+                        print(f"Converting image {idx} from {img.dtype} to int16")
+                        # Scale values to appropriate range for int16
+                        if img.dtype == np.uint8:
+                            img = img.astype(np.int16) * 256
+                        else:
+                            img = img.astype(np.int16)
+                    
+                    # Verify image properties
+                    if len(img.shape) != 3 or img.shape[2] != 3:
+                        raise StitchingError(f"Image {idx} must have 3 channels, got shape {img.shape}")
+                    
+                    # Ensure mask is binary uint8
+                    if mask.dtype != np.uint8:
+                        print(f"Converting mask {idx} from {mask.dtype} to uint8")
+                        mask = mask.astype(np.uint8)
+                        
+                    # Ensure mask is binary (0 or 255)
+                    mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)[1]
+                    
+                    print(f"Feeding blender with image {idx}: dtype={img.dtype}, shape={img.shape}, value range=[{img.min()}, {img.max()}]")
+                    self.blender.feed(img, mask, corner)
+                    
+                except cv2.error as e:
+                    raise StitchingError(f"OpenCV error while processing image {idx}: {str(e)}")
+                except Exception as e:
+                    raise StitchingError(f"Error processing image {idx}: {str(e)}")
+            
+        except Exception as e:
+            raise StitchingError(f"Error during blending: {str(e)}")
 
     def create_final_panorama(self):
         if not self.timelapser.do_timelapse:
-            panorama, _ = self.blender.blend()
-            return panorama
+            try:
+                print("Starting final blend...")
+                result, result_mask = self.blender.blend()
+                print(f"Blend complete. Result shape: {result.shape}, dtype: {result.dtype}")
+                
+                # Convert result to appropriate format if needed
+                if result.dtype == np.int16:
+                    # Scale back to uint8 range
+                    result = np.clip(result / 256, 0, 255).astype(np.uint8)
+                
+                return result
+            except cv2.error as e:
+                raise StitchingError(f"Error in final blending: {str(e)}")
+            except Exception as e:
+                raise StitchingError(f"Unexpected error in final blending: {str(e)}")
 
     def validate_kwargs(self, kwargs):
         for arg in kwargs:
